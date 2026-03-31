@@ -2,7 +2,7 @@
 
 Ubah gambar yang diunggah menjadi animasi partikel yang membentuk ulang potret target.
 
-**Jokowify** adalah eksperimen visual berbasis browser yang dibuat dengan **React**, **WebGL**, dan simulasi partikel ringan. Kamu mengunggah gambar sumber, lalu aplikasi akan mengubahnya menjadi ribuan partikel yang bergerak dan membentuk struktur gambar target. Saat ini, aplikasi memakai `image.jpg` sebagai gambar target default dan menampilkan hasilnya langsung di browser. :contentReference[oaicite:0]{index=0}
+**Jokowify** adalah eksperimen visual berbasis browser yang dibuat dengan **WebGL** dan simulasi partikel ringan. Kamu mengunggah gambar sumber, lalu aplikasi akan mengubahnya menjadi ribuan partikel yang bergerak dan membentuk struktur gambar target. Saat ini, aplikasi memakai `image.jpg` sebagai gambar target default dan menampilkan hasilnya langsung di browser. :contentReference[oaicite:0]{index=0}
 
 ## Fitur
 
