@@ -1,0 +1,1099 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Source to image.jpg Remap Visualization</title>
+  <link rel="icon" href="data:," />
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <style>
+    :root {
+      --bg: #f5f5f5;
+      --panel: #ffffff;
+      --line: #d9d9d9;
+      --text: #111111;
+      --muted: #555555;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: Arial, Helvetica, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+    }
+    #root { min-height: 100vh; }
+    .app {
+      width: min(920px, calc(100vw - 32px));
+      margin: 0 auto;
+      padding: 32px 0 40px;
+      display: grid;
+      gap: 16px;
+    }
+    .layout {
+      display: grid;
+      gap: 16px;
+    }
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 0;
+      box-shadow: none;
+    }
+    .controls {
+      padding: 16px;
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+      gap: 12px;
+      align-items: end;
+    }
+    .control { display: grid; gap: 6px; }
+    .control.slider { grid-column: 1 / -1; }
+    label { font-size: 13px; color: var(--text); }
+    input[type="file"], input[type="range"], button { width: 100%; }
+    button {
+      border: 1px solid var(--line);
+      background: #ffffff;
+      color: var(--text);
+      border-radius: 0;
+      padding: 8px 10px;
+      font: inherit;
+      cursor: pointer;
+    }
+    button.primary {
+      border-color: #111111;
+      color: #ffffff;
+      font-weight: 400;
+      background: #111111;
+    }
+    .viewer {
+      padding: 16px;
+      display: flex;
+      justify-content: center;
+    }
+    .cards {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 14px;
+      width: 100%;
+    }
+    .card {
+      padding: 12px;
+      border: 1px solid var(--line);
+      border-radius: 0;
+      background: #ffffff;
+    }
+    canvas, .sideWrap {
+      width: 100%;
+      display: block;
+      border-radius: 0;
+      border: 1px solid var(--line);
+      background: #ffffff;
+    }
+    .previewCanvas { aspect-ratio: 1; }
+    .glCanvas { aspect-ratio: 1; }
+    .glCanvasHidden {
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      opacity: 0;
+      pointer-events: none;
+    }
+    .sideWrap {
+      aspect-ratio: 1;
+      overflow: hidden;
+      position: relative;
+    }
+    .sideWrap canvas {
+      border: 0;
+      border-radius: 0;
+      width: 100% !important;
+      height: 100% !important;
+      display: block;
+    }
+    @media (max-width: 820px) {
+      .layout {
+        display: flex;
+        flex-direction: column;
+      }
+      .viewer { order: 1; }
+      .controls {
+        order: 2;
+      }
+      .controls { grid-template-columns: 1fr; }
+      .cards { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://unpkg.com/three@0.161.0/build/three.module.js"
+      }
+    }
+  </script>
+<script type="text/babel" data-type="module">
+  import * as THREE from 'three';
+  import { OrbitControls } from 'https://unpkg.com/three@0.161.0/examples/jsm/controls/OrbitControls.js';
+
+  const { useCallback, useEffect, useMemo, useRef, useState } = React;
+
+  const VERTEX_SHADER = `
+    attribute vec2 aPosition;
+    attribute vec4 aColor;
+    uniform float uResolution;
+    uniform float uPointSize;
+    varying vec4 vColor;
+    void main() {
+      vec2 uv = (aPosition + vec2(0.5)) / uResolution;
+      vec2 clip = uv * 2.0 - 1.0;
+      clip.y *= -1.0;
+      gl_Position = vec4(clip, 0.0, 1.0);
+      gl_PointSize = uPointSize;
+      vColor = aColor;
+    }
+  `;
+
+  const FRAGMENT_SHADER = `
+    precision mediump float;
+    varying vec4 vColor;
+    void main() {
+      vec2 p = gl_PointCoord * 2.0 - 1.0;
+      float dist = dot(p, p);
+      if (dist > 1.0) discard;
+      float alpha = vColor.a * smoothstep(1.0, 0.0, dist);
+      gl_FragColor = vec4(vColor.rgb, alpha);
+    }
+  `;
+
+  function clamp(value, min, max) {
+    return Math.min(max, Math.max(min, value));
+  }
+
+  function createDefaultCrop() {
+    return { scale: 1, offsetX: 0.5, offsetY: 0.5 };
+  }
+
+  function drawCropPreview(canvas, image, crop) {
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    const size = canvas.width;
+    ctx.clearRect(0, 0, size, size);
+    if (!image) {
+      ctx.fillStyle = '#0b1320';
+      ctx.fillRect(0, 0, size, size);
+      return;
+    }
+    const side = Math.min(image.width, image.height) / crop.scale;
+    const sx = clamp(crop.offsetX, 0, 1) * Math.max(0, image.width - side);
+    const sy = clamp(crop.offsetY, 0, 1) * Math.max(0, image.height - side);
+    ctx.drawImage(image, sx, sy, side, side, 0, 0, size, size);
+  }
+
+  function sampleSquareImage(image, crop, resolution) {
+    const canvas = document.createElement('canvas');
+    canvas.width = resolution;
+    canvas.height = resolution;
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    if (image) {
+      const side = Math.min(image.width, image.height) / crop.scale;
+      const sx = clamp(crop.offsetX, 0, 1) * Math.max(0, image.width - side);
+      const sy = clamp(crop.offsetY, 0, 1) * Math.max(0, image.height - side);
+      ctx.drawImage(image, sx, sy, side, side, 0, 0, resolution, resolution);
+    }
+    return { canvas, pixels: ctx.getImageData(0, 0, resolution, resolution).data };
+  }
+
+  function pixelLuma(pixels, index) {
+    return (pixels[index] * 0.299 + pixels[index + 1] * 0.587 + pixels[index + 2] * 0.114) / 255;
+  }
+
+  function computeEdgeMap(pixels, resolution) {
+    const edge = new Float32Array(resolution * resolution);
+    for (let y = 1; y < resolution - 1; y++) {
+      for (let x = 1; x < resolution - 1; x++) {
+        const i = y * resolution + x;
+        const idx = i * 4;
+        const l = pixelLuma(pixels, idx);
+        const lx = pixelLuma(pixels, idx + 4) - pixelLuma(pixels, idx - 4);
+        const ly = pixelLuma(pixels, idx + resolution * 4) - pixelLuma(pixels, idx - resolution * 4);
+        edge[i] = Math.abs(lx) + Math.abs(ly) + (1 - l) * 0.35;
+      }
+    }
+    return edge;
+  }
+
+  function buildTargetMask(targetPixels, resolution, threshold) {
+    const edge = computeEdgeMap(targetPixels, resolution);
+    const mask = new Uint8Array(resolution * resolution);
+    for (let y = 0; y < resolution; y++) {
+      for (let x = 0; x < resolution; x++) {
+        const i = y * resolution + x;
+        const idx = i * 4;
+        const alpha = targetPixels[idx + 3] / 255;
+        const luma = pixelLuma(targetPixels, idx);
+        const darkness = 1 - luma;
+        const structure = darkness * 0.9 + edge[i] * 1.2 + alpha * 0.15;
+        if (alpha > 0.1 && (darkness > threshold || edge[i] > threshold * 0.65 || structure > threshold * 1.15)) {
+          mask[i] = 1;
+        }
+      }
+    }
+
+    const refined = new Uint8Array(mask.length);
+    for (let y = 0; y < resolution; y++) {
+      for (let x = 0; x < resolution; x++) {
+        let neighbors = 0;
+        for (let oy = -1; oy <= 1; oy++) {
+          for (let ox = -1; ox <= 1; ox++) {
+            const nx = x + ox;
+            const ny = y + oy;
+            if (nx < 0 || ny < 0 || nx >= resolution || ny >= resolution) continue;
+            neighbors += mask[ny * resolution + nx];
+          }
+        }
+        const i = y * resolution + x;
+        refined[i] = mask[i] || neighbors >= 4 ? 1 : 0;
+      }
+    }
+    return refined;
+  }
+
+  function extractTargetPoints(targetPixels, resolution, threshold, count) {
+    const mask = buildTargetMask(targetPixels, resolution, threshold);
+    const occupied = [];
+    for (let y = 0; y < resolution; y++) {
+      for (let x = 0; x < resolution; x++) {
+        const index = y * resolution + x;
+        if (mask[index]) {
+          const idx = index * 4;
+          occupied.push({
+            x,
+            y,
+            brightness: pixelLuma(targetPixels, idx),
+            nx: x / Math.max(1, resolution - 1),
+            ny: y / Math.max(1, resolution - 1),
+          });
+        }
+      }
+    }
+
+    if (!occupied.length) {
+      for (let y = 0; y < resolution; y++) {
+        for (let x = 0; x < resolution; x++) {
+          const idx = (y * resolution + x) * 4;
+          occupied.push({
+            x,
+            y,
+            brightness: pixelLuma(targetPixels, idx),
+            nx: x / Math.max(1, resolution - 1),
+            ny: y / Math.max(1, resolution - 1),
+          });
+        }
+      }
+    }
+
+    occupied.sort((a, b) => (a.y - b.y) || (a.x - b.x));
+    const chosen = [];
+    if (occupied.length >= count) {
+      const step = occupied.length / count;
+      for (let i = 0; i < count; i++) {
+        chosen.push(occupied[Math.min(occupied.length - 1, Math.floor(i * step))]);
+      }
+    } else {
+      for (const point of occupied) chosen.push({ ...point });
+      let duplicateIndex = 0;
+      while (chosen.length < count) {
+        const base = occupied[duplicateIndex % occupied.length];
+        const ring = Math.floor(duplicateIndex / occupied.length) + 1;
+        const angle = duplicateIndex * 2.399963229728653;
+        const radius = Math.min(0.42, 0.11 * ring);
+        const x = clamp(base.x + Math.cos(angle) * radius, 0, resolution - 1);
+        const y = clamp(base.y + Math.sin(angle) * radius, 0, resolution - 1);
+        chosen.push({
+          x,
+          y,
+          brightness: base.brightness,
+          nx: x / Math.max(1, resolution - 1),
+          ny: y / Math.max(1, resolution - 1),
+        });
+        duplicateIndex++;
+      }
+    }
+    return annotateRevealSchedule(chosen);
+  }
+
+  function annotateRevealSchedule(targetPoints) {
+    if (!targetPoints.length) return targetPoints;
+    const gridSize = Math.max(4, Math.min(8, Math.round(Math.sqrt(targetPoints.length) / 16)));
+    const clustersByKey = new Map();
+
+    for (const point of targetPoints) {
+      const gx = clamp(Math.floor(point.nx * gridSize), 0, gridSize - 1);
+      const gy = clamp(Math.floor(point.ny * gridSize), 0, gridSize - 1);
+      const key = `${gx}:${gy}`;
+      let cluster = clustersByKey.get(key);
+      if (!cluster) {
+        cluster = { points: [], sumX: 0, sumY: 0, sumBrightness: 0 };
+        clustersByKey.set(key, cluster);
+      }
+      cluster.points.push(point);
+      cluster.sumX += point.nx;
+      cluster.sumY += point.ny;
+      cluster.sumBrightness += point.brightness;
+    }
+
+    const clusters = [...clustersByKey.values()].map((cluster) => {
+      const count = cluster.points.length;
+      const cx = cluster.sumX / count;
+      const cy = cluster.sumY / count;
+      const avgBrightness = cluster.sumBrightness / count;
+      const centerDx = cx - 0.5;
+      const centerDy = cy - 0.42;
+      const centerDistance = Math.hypot(centerDx, centerDy);
+      const portraitBias = Math.abs(cy - 0.42) * 0.55 + (cx < 0.2 || cx > 0.8 ? 0.16 : 0);
+      cluster.cx = cx;
+      cluster.cy = cy;
+      cluster.priority = centerDistance * 1.4 + portraitBias + avgBrightness * 0.18;
+      return cluster;
+    });
+
+    clusters.sort((a, b) => a.priority - b.priority);
+    const span = Math.max(1, clusters.length - 1);
+    for (let ci = 0; ci < clusters.length; ci++) {
+      const cluster = clusters[ci];
+      const clusterBase = 0.05 + (ci / span) * 0.72;
+      for (const point of cluster.points) {
+        const localDistance = Math.hypot(point.nx - cluster.cx, point.ny - cluster.cy);
+        const localJitter = Math.abs((Math.sin((point.x + 1) * 12.9898 + (point.y + 1) * 78.233) * 43758.5453) % 1) * 0.035;
+        point.revealAt = clamp(clusterBase + localDistance * 0.45 + localJitter, 0, 0.96);
+      }
+    }
+    return targetPoints;
+  }
+
+  function buildParticles(sourcePixels, resolution) {
+    const count = resolution * resolution;
+    const particles = new Array(count);
+    const positions = new Float32Array(count * 2);
+    const colors = new Float32Array(count * 4);
+    let p = 0;
+    let c = 0;
+    for (let y = 0; y < resolution; y++) {
+      for (let x = 0; x < resolution; x++) {
+        const id = y * resolution + x;
+        const idx = id * 4;
+        const r = sourcePixels[idx] / 255;
+        const g = sourcePixels[idx + 1] / 255;
+        const b = sourcePixels[idx + 2] / 255;
+        const a = sourcePixels[idx + 3] / 255;
+        particles[id] = {
+          id,
+          sourceX: x,
+          sourceY: y,
+          sourceNX: x / Math.max(1, resolution - 1),
+          sourceNY: y / Math.max(1, resolution - 1),
+          currentX: x,
+          currentY: y,
+          targetX: x,
+          targetY: y,
+          currentZ: 0,
+          targetZ: 0,
+          vz: 0,
+          vx: 0,
+          vy: 0,
+          brightness: r * 0.299 + g * 0.587 + b * 0.114,
+        };
+        positions[p++] = x;
+        positions[p++] = y;
+        colors[c++] = r;
+        colors[c++] = g;
+        colors[c++] = b;
+        colors[c++] = a;
+      }
+    }
+    return { particles, positions, colors };
+  }
+
+  function mulberry32(seed) {
+    let t = seed >>> 0;
+    return function () {
+      t += 0x6d2b79f5;
+      let r = Math.imul(t ^ (t >>> 15), t | 1);
+      r ^= r + Math.imul(r ^ (r >>> 7), r | 61);
+      return ((r ^ (r >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  function makeInitialAssignments(particles, targetPoints, seed) {
+    const rng = mulberry32(seed);
+    const sourceOrder = particles.map((particle) => particle.id);
+    const targetOrder = targetPoints.map((_, index) => index);
+    sourceOrder.sort((a, b) => {
+      const ay = particles[a].sourceY - particles[b].sourceY;
+      const ax = particles[a].sourceX - particles[b].sourceX;
+      const diff = ay || ax;
+      return diff || (particles[a].brightness - particles[b].brightness) || (rng() - 0.5);
+    });
+    targetOrder.sort((a, b) => {
+      const py = targetPoints[a].y - targetPoints[b].y;
+      const px = targetPoints[a].x - targetPoints[b].x;
+      const diff = py || px;
+      return diff || (targetPoints[a].brightness - targetPoints[b].brightness) || (rng() - 0.5);
+    });
+    const assignments = new Int32Array(particles.length);
+    for (let i = 0; i < particles.length; i++) assignments[sourceOrder[i]] = targetOrder[i % targetOrder.length];
+    return assignments;
+  }
+
+  function assignmentScore(particle, targetPoint, proximityImportance) {
+    const dx = particle.sourceNX - targetPoint.nx;
+    const dy = particle.sourceNY - targetPoint.ny;
+    const spatial = dx * dx + dy * dy;
+    const brightness = particle.brightness - targetPoint.brightness;
+    return brightness * brightness * 24 + spatial * proximityImportance * 180;
+  }
+
+  function setParticleDestination(particle, target, depthScale) {
+    particle.targetX = target.x;
+    particle.targetY = target.y;
+    particle.revealAt = target.revealAt ?? clamp(target.ny * 0.78 + target.nx * 0.22, 0, 1);
+    const centerBias = 1 - Math.hypot(target.nx - 0.5, target.ny - 0.48) * 1.55;
+    const depthShape = clamp((1 - target.brightness) * 0.72 + centerBias * 0.28, 0, 1);
+    particle.targetZ = (depthShape - 0.5) * depthScale;
+  }
+
+  function applyAssignments(particles, targetPoints, assignments, depthScale) {
+    for (let i = 0; i < particles.length; i++) setParticleDestination(particles[i], targetPoints[assignments[i]], depthScale);
+  }
+
+  function improveAssignments(state, budget, depthScale) {
+    if (!state) return 0;
+    const { particles, targetPoints, assignments, proximityImportance, rng } = state;
+    const total = particles.length;
+    let accepted = 0;
+    for (let step = 0; step < budget; step++) {
+      const a = (rng() * total) | 0;
+      let b = (rng() * total) | 0;
+      if (a === b) b = (b + 1) % total;
+      const particleA = particles[a];
+      const particleB = particles[b];
+      const assignA = assignments[a];
+      const assignB = assignments[b];
+      const targetA = targetPoints[assignA];
+      const targetB = targetPoints[assignB];
+      const before = assignmentScore(particleA, targetA, proximityImportance) + assignmentScore(particleB, targetB, proximityImportance);
+      const after = assignmentScore(particleA, targetB, proximityImportance) + assignmentScore(particleB, targetA, proximityImportance);
+      if (after < before) {
+        assignments[a] = assignB;
+        assignments[b] = assignA;
+        setParticleDestination(particleA, targetB, depthScale);
+        setParticleDestination(particleB, targetA, depthScale);
+        accepted++;
+      }
+    }
+    return accepted;
+  }
+
+  function restartParticles(particles, sideDepth, random = Math.random) {
+    for (const particle of particles) {
+      particle.currentX = particle.sourceX;
+      particle.currentY = particle.sourceY;
+      particle.currentZ = (random() - 0.5) * sideDepth * 1.8;
+      particle.vx = 0;
+      particle.vy = 0;
+      particle.vz = 0;
+    }
+  }
+
+  function stepParticles(particles, dt, springStrength, damping, revealProgress) {
+    let movingCount = 0;
+    for (const particle of particles) {
+      const reveal = clamp((revealProgress - particle.revealAt) * 5, 0, 1);
+      const easedReveal = reveal * reveal * (3 - 2 * reveal);
+      const goalX = particle.sourceX + (particle.targetX - particle.sourceX) * easedReveal;
+      const goalY = particle.sourceY + (particle.targetY - particle.sourceY) * easedReveal;
+      const goalZ = particle.currentZ + (particle.targetZ - particle.currentZ) * (0.03 + easedReveal * 0.18);
+      const ax = (goalX - particle.currentX) * springStrength;
+      const ay = (goalY - particle.currentY) * springStrength;
+      const az = (goalZ - particle.currentZ) * springStrength * 0.65;
+      particle.vx = (particle.vx + ax * dt) * damping;
+      particle.vy = (particle.vy + ay * dt) * damping;
+      particle.vz = (particle.vz + az * dt) * (damping * 0.98);
+      particle.currentX += particle.vx * dt * 60;
+      particle.currentY += particle.vy * dt * 60;
+      particle.currentZ += particle.vz * dt * 60;
+      if (Math.abs(goalX - particle.currentX) + Math.abs(goalY - particle.currentY) + Math.abs(goalZ - particle.currentZ) + Math.abs(particle.vx) + Math.abs(particle.vy) + Math.abs(particle.vz) > 0.03) {
+        movingCount++;
+      } else {
+        particle.currentX = goalX;
+        particle.currentY = goalY;
+        particle.currentZ = goalZ;
+        particle.vx = 0;
+        particle.vy = 0;
+        particle.vz = 0;
+      }
+    }
+    return movingCount;
+  }
+
+  function captureFrame(particles, resolution) {
+    const xy = new Float32Array(particles.length * 2);
+    const xyz = new Float32Array(particles.length * 3);
+    let p2 = 0;
+    let p3 = 0;
+    for (const particle of particles) {
+      xy[p2++] = particle.currentX;
+      xy[p2++] = particle.currentY;
+
+      const nx = (particle.currentX / Math.max(1, resolution - 1)) - 0.5;
+      const ny = 0.5 - (particle.currentY / Math.max(1, resolution - 1));
+      xyz[p3++] = particle.currentZ * 0.55;
+      xyz[p3++] = ny * 160;
+      xyz[p3++] = nx * 120;
+    }
+    return { xy, xyz };
+  }
+
+  function recordSimulationFrames({
+    particles,
+    targetPoints,
+    assignments,
+    proximityImportance,
+    resolution,
+    qualitySpeed,
+    springStrength,
+    damping,
+    sideDepth,
+    seed
+  }) {
+    const fps = 30;
+    const dt = 1 / fps;
+    const maxFrames = 180;
+    const settleFramesNeeded = 10;
+    const revealRate = 0.1 + (1 - qualitySpeed) * 0.18;
+    const rng = mulberry32(seed * 409 + resolution * 17 + 7);
+
+    restartParticles(particles, sideDepth, rng);
+
+    const sim = {
+      particles,
+      targetPoints,
+      assignments,
+      proximityImportance,
+      rng: mulberry32(seed * 101 + resolution),
+      acceptedTotal: 0,
+      stagnantFrames: 0,
+      optimizeActive: true,
+      revealProgress: 0,
+      movingCount: particles.length,
+    };
+
+    const frames = [captureFrame(particles, resolution)];
+    let settledFrames = 0;
+
+    for (let frame = 1; frame < maxFrames; frame++) {
+      sim.revealProgress = Math.min(1, sim.revealProgress + dt * revealRate);
+
+      if (sim.optimizeActive) {
+        const budget = Math.max(24, Math.floor(sim.particles.length * (0.08 + qualitySpeed * 0.42)));
+        const accepted = improveAssignments({
+          particles: sim.particles,
+          targetPoints: sim.targetPoints,
+          assignments: sim.assignments,
+          proximityImportance,
+          rng: sim.rng,
+        }, budget, sideDepth);
+        sim.acceptedTotal += accepted;
+        sim.stagnantFrames = accepted === 0 ? sim.stagnantFrames + 1 : 0;
+        if (sim.stagnantFrames > 45 || (sim.revealProgress >= 1 && accepted < 2 && sim.stagnantFrames > 12)) {
+          sim.optimizeActive = false;
+        }
+      }
+
+      sim.movingCount = stepParticles(sim.particles, dt, springStrength * 0.62, damping, sim.revealProgress);
+      frames.push(captureFrame(sim.particles, resolution));
+
+      if (sim.revealProgress >= 1 && sim.movingCount === 0 && !sim.optimizeActive) {
+        settledFrames++;
+        if (settledFrames >= settleFramesNeeded) break;
+      } else {
+        settledFrames = 0;
+      }
+    }
+
+    return frames;
+  }
+
+  function compileShader(gl, type, source) {
+    const shader = gl.createShader(type);
+    gl.shaderSource(shader, source);
+    gl.compileShader(shader);
+    if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(shader) || 'Shader compile failed');
+    return shader;
+  }
+
+  function createProgram(gl) {
+    const program = gl.createProgram();
+    gl.attachShader(program, compileShader(gl, gl.VERTEX_SHADER, VERTEX_SHADER));
+    gl.attachShader(program, compileShader(gl, gl.FRAGMENT_SHADER, FRAGMENT_SHADER));
+    gl.linkProgram(program);
+    if (!gl.getProgramParameter(program, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(program) || 'Program link failed');
+    return program;
+  }
+
+  function initGl(canvas) {
+    const gl = canvas.getContext('webgl', { antialias: true, preserveDrawingBuffer: true });
+    if (!gl) throw new Error('WebGL not supported');
+    const program = createProgram(gl);
+    const positionBuffer = gl.createBuffer();
+    const colorBuffer = gl.createBuffer();
+    gl.useProgram(program);
+    gl.enable(gl.BLEND);
+    gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+    return {
+      gl,
+      program,
+      positionBuffer,
+      colorBuffer,
+      aPosition: gl.getAttribLocation(program, 'aPosition'),
+      aColor: gl.getAttribLocation(program, 'aColor'),
+      uResolution: gl.getUniformLocation(program, 'uResolution'),
+      uPointSize: gl.getUniformLocation(program, 'uPointSize'),
+    };
+  }
+
+  function uploadStaticColors(glApi, colors) {
+    const { gl, colorBuffer, aColor } = glApi;
+    gl.bindBuffer(gl.ARRAY_BUFFER, colorBuffer);
+    gl.bufferData(gl.ARRAY_BUFFER, colors, gl.STATIC_DRAW);
+    gl.enableVertexAttribArray(aColor);
+    gl.vertexAttribPointer(aColor, 4, gl.FLOAT, false, 0, 0);
+  }
+
+  function renderGl(glApi, positions, count, resolution, particleSize) {
+    const { gl, positionBuffer, aPosition, uResolution, uPointSize } = glApi;
+    const dpr = window.devicePixelRatio || 1;
+    const canvas = gl.canvas;
+    const width = Math.floor(canvas.clientWidth * dpr);
+    const height = Math.floor(canvas.clientHeight * dpr);
+    if (canvas.width !== width || canvas.height !== height) {
+      canvas.width = width;
+      canvas.height = height;
+    }
+    gl.viewport(0, 0, canvas.width, canvas.height);
+    gl.clearColor(0.02, 0.03, 0.05, 1.0);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    gl.useProgram(glApi.program);
+    gl.uniform1f(uResolution, resolution);
+    gl.uniform1f(uPointSize, particleSize * dpr);
+    gl.bindBuffer(gl.ARRAY_BUFFER, positionBuffer);
+    gl.bufferData(gl.ARRAY_BUFFER, positions, gl.DYNAMIC_DRAW);
+    gl.enableVertexAttribArray(aPosition);
+    gl.vertexAttribPointer(aPosition, 2, gl.FLOAT, false, 0, 0);
+    gl.drawArrays(gl.POINTS, 0, count);
+  }
+
+  function createSideView(container) {
+    const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    renderer.setSize(container.clientWidth, container.clientHeight, false);
+    container.innerHTML = '';
+    container.appendChild(renderer.domElement);
+
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x05080d);
+
+    const aspect = container.clientWidth / Math.max(1, container.clientHeight);
+    const frustum = 180;
+    const camera = new THREE.OrthographicCamera(
+      -frustum * aspect,
+      frustum * aspect,
+      frustum,
+      -frustum,
+      0.1,
+      3000
+    );
+
+    // True side view: look along image-width axis.
+    // x = depth, y = height, z = width
+    camera.position.set(0, 0, 320);
+    camera.lookAt(0, 0, 0);
+
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true;
+    controls.dampingFactor = 0.06;
+    controls.enableRotate = true;
+    controls.enablePan = true;
+    controls.minZoom = 0.8;
+    controls.maxZoom = 3;
+    controls.target.set(0, 0, 0);
+    controls.update();
+
+    const ambient = new THREE.AmbientLight(0xffffff, 1.05);
+    scene.add(ambient);
+
+    const light = new THREE.DirectionalLight(0xffffff, 1.1);
+    light.position.set(1, 1, 2);
+    scene.add(light);
+
+    const grid = new THREE.GridHelper(900, 18, 0x1f2a3d, 0x101827);
+    grid.position.y = -160;
+    scene.add(grid);
+
+    const geometry = new THREE.BufferGeometry();
+    const material = new THREE.PointsMaterial({
+      size: 3.2,
+      vertexColors: true,
+      transparent: true,
+      opacity: 0.96,
+      depthWrite: false,
+      sizeAttenuation: false
+    });
+    const points = new THREE.Points(geometry, material);
+    scene.add(points);
+
+    return {
+      container,
+      renderer,
+      scene,
+      camera,
+      controls,
+      geometry,
+      material,
+      points,
+      frustum
+    };
+  }
+
+  function syncSideView(sideApi, frame3d, colors, sidePointSize) {
+    if (!sideApi || !frame3d || !colors) return;
+
+    const count = frame3d.length / 3;
+    let positionAttr = sideApi.geometry.getAttribute('position');
+    let colorAttr = sideApi.geometry.getAttribute('color');
+
+    if (!positionAttr || positionAttr.count !== count) {
+      sideApi.geometry.setAttribute('position', new THREE.BufferAttribute(new Float32Array(count * 3), 3));
+      sideApi.geometry.setAttribute('color', new THREE.BufferAttribute(new Float32Array(count * 3), 3));
+      positionAttr = sideApi.geometry.getAttribute('position');
+      colorAttr = sideApi.geometry.getAttribute('color');
+    }
+
+    for (let i = 0; i < count; i++) {
+      positionAttr.array[i * 3] = frame3d[i * 3];
+      positionAttr.array[i * 3 + 1] = frame3d[i * 3 + 1];
+      positionAttr.array[i * 3 + 2] = frame3d[i * 3 + 2];
+
+      colorAttr.array[i * 3] = colors[i * 4];
+      colorAttr.array[i * 3 + 1] = colors[i * 4 + 1];
+      colorAttr.array[i * 3 + 2] = colors[i * 4 + 2];
+    }
+
+    positionAttr.needsUpdate = true;
+    colorAttr.needsUpdate = true;
+    sideApi.material.size = Math.max(1.2, sidePointSize * 0.9);
+
+    const width = sideApi.container.clientWidth;
+    const height = sideApi.container.clientHeight;
+    const dpr = Math.min(window.devicePixelRatio, 2);
+    const targetPixelWidth = Math.floor(width * dpr);
+    const targetPixelHeight = Math.floor(height * dpr);
+
+    if (
+      sideApi.renderer.domElement.width !== targetPixelWidth ||
+      sideApi.renderer.domElement.height !== targetPixelHeight
+    ) {
+      sideApi.renderer.setSize(width, height, false);
+
+      const aspect = width / Math.max(1, height);
+      const frustum = sideApi.frustum;
+
+      sideApi.camera.left = -frustum * aspect;
+      sideApi.camera.right = frustum * aspect;
+      sideApi.camera.top = frustum;
+      sideApi.camera.bottom = -frustum;
+      sideApi.camera.updateProjectionMatrix();
+    }
+
+    sideApi.controls.update();
+    sideApi.renderer.render(sideApi.scene, sideApi.camera);
+  }
+
+  function loadImageFromFile(file) {
+    return new Promise((resolve, reject) => {
+      if (!file) {
+        resolve(null);
+        return;
+      }
+      const reader = new FileReader();
+      reader.onload = () => {
+        const image = new Image();
+        image.onload = () => resolve(image);
+        image.onerror = reject;
+        image.src = reader.result;
+      };
+      reader.onerror = reject;
+      reader.readAsDataURL(file);
+    });
+  }
+
+  async function loadImageFromUrl(url) {
+    const response = await fetch(url, { cache: 'no-store' });
+    if (!response.ok) throw new Error(`Missing image: ${url}`);
+    const blob = await response.blob();
+    const objectUrl = URL.createObjectURL(blob);
+    return new Promise((resolve, reject) => {
+      const image = new Image();
+      image.onload = () => {
+        URL.revokeObjectURL(objectUrl);
+        resolve(image);
+      };
+      image.onerror = (error) => {
+        URL.revokeObjectURL(objectUrl);
+        reject(error);
+      };
+      image.src = objectUrl;
+    });
+  }
+
+  function createFallbackImage(label, palette) {
+    const canvas = document.createElement('canvas');
+    canvas.width = 512;
+    canvas.height = 512;
+    const ctx = canvas.getContext('2d');
+    const gradient = ctx.createLinearGradient(0, 0, 512, 512);
+    gradient.addColorStop(0, palette[0]);
+    gradient.addColorStop(1, palette[1]);
+    ctx.fillStyle = gradient;
+    ctx.fillRect(0, 0, 512, 512);
+    ctx.fillStyle = palette[2];
+    ctx.beginPath();
+    ctx.arc(256, 180, 120, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillRect(140, 326, 232, 128);
+    ctx.fillStyle = palette[3];
+    ctx.fillRect(176, 154, 42, 16);
+    ctx.fillRect(294, 154, 42, 16);
+    ctx.fillRect(216, 262, 82, 18);
+    ctx.fillStyle = 'rgba(255,255,255,0.75)';
+    ctx.font = '700 32px Georgia';
+    ctx.textAlign = 'center';
+    ctx.fillText(label, 256, 474);
+    const image = new Image();
+    image.src = canvas.toDataURL('image/png');
+    return image;
+  }
+
+  function App() {
+    const [sourceImage, setSourceImage] = useState(() => createFallbackImage('Source', ['#d9632f', '#f0bf62', 'rgba(247,232,213,0.96)', 'rgba(38,24,18,0.72)']));
+    const [targetImage, setTargetImage] = useState(() => createFallbackImage('Target', ['#1d6f7c', '#89bfd9', 'rgba(237,216,196,0.97)', 'rgba(24,15,12,0.76)']));
+    const [sourceCrop, setSourceCrop] = useState(createDefaultCrop);
+    const [targetCrop] = useState(createDefaultCrop);
+    const [resolution, setResolution] = useState(160);
+    const [particleSize, setParticleSize] = useState(5.8);
+    const [springStrength, setSpringStrength] = useState(14);
+    const [damping, setDamping] = useState(0.84);
+    const [threshold, setThreshold] = useState(0.28);
+    const [proximityImportance, setProximityImportance] = useState(0.55);
+    const [qualitySpeed, setQualitySpeed] = useState(0.55);
+    const [sideDepth, setSideDepth] = useState(110);
+    const [playback, setPlayback] = useState({ frames: [], colors: null, fps: 30 });
+    const [frameIndex, setFrameIndex] = useState(0);
+    const [playing, setPlaying] = useState(false);
+    const [sideViewVersion, setSideViewVersion] = useState(0);
+    const [sideInteractionVersion, setSideInteractionVersion] = useState(0);
+    const glCanvasRef = useRef(null);
+    const sourcePreviewRef = useRef(null);
+    const glRef = useRef(null);
+    const rafRef = useRef(0);
+    const playbackClockRef = useRef({ lastTime: 0, accumulator: 0 });
+    const sideRef = useRef(null);
+    const sideApiRef = useRef(null);
+
+    const sampledSource = useMemo(() => sampleSquareImage(sourceImage, sourceCrop, resolution), [sourceImage, sourceCrop, resolution]);
+    const sampledTarget = useMemo(() => sampleSquareImage(targetImage, targetCrop, resolution), [targetImage, targetCrop, resolution]);
+
+    useEffect(() => {
+      drawCropPreview(sourcePreviewRef.current, sourceImage, sourceCrop);
+    }, [sourceImage, sourceCrop]);
+
+    useEffect(() => {
+      if (!glRef.current && glCanvasRef.current) glRef.current = initGl(glCanvasRef.current);
+    }, []);
+
+    useEffect(() => {
+      if (glRef.current && playback.colors) {
+        uploadStaticColors(glRef.current, playback.colors);
+      }
+    }, [playback.colors]);
+
+    useEffect(() => {
+      if (sideRef.current && !sideApiRef.current) {
+        sideApiRef.current = createSideView(sideRef.current);
+        sideApiRef.current.controls.addEventListener('change', () => {
+          setSideInteractionVersion((value) => value + 1);
+        });
+        setSideViewVersion((value) => value + 1);
+      }
+      return () => {
+        if (sideApiRef.current) {
+          sideApiRef.current.controls.dispose();
+          sideApiRef.current.geometry.dispose();
+          sideApiRef.current.material.dispose();
+          sideApiRef.current.renderer.dispose();
+        }
+      };
+    }, []);
+
+    useEffect(() => {
+      let active = true;
+      loadImageFromUrl('./image.jpg').then((image) => {
+        if (active) setTargetImage(image);
+      }).catch(() => {});
+      return () => { active = false; };
+    }, []);
+
+    const rebuildSimulation = useCallback((seed = 1) => {
+      const { particles, positions, colors } = buildParticles(sampledSource.pixels, resolution);
+      const targetPoints = extractTargetPoints(sampledTarget.pixels, resolution, threshold, particles.length);
+      const assignments = makeInitialAssignments(particles, targetPoints, seed);
+      applyAssignments(particles, targetPoints, assignments, sideDepth);
+      const frames = recordSimulationFrames({
+        particles,
+        targetPoints,
+        assignments,
+        proximityImportance,
+        resolution,
+        qualitySpeed,
+        springStrength,
+        damping,
+        sideDepth,
+        seed,
+      });
+      if (glRef.current) uploadStaticColors(glRef.current, colors);
+      setPlayback({ frames, colors, fps: 30, count: positions.length / 2 });
+      setFrameIndex(0);
+      setPlaying(true);
+    }, [sampledSource, sampledTarget, resolution, threshold, proximityImportance, qualitySpeed, springStrength, damping, sideDepth]);
+
+    useEffect(() => {
+      rebuildSimulation(1);
+    }, [rebuildSimulation]);
+
+    useEffect(() => {
+      const glApi = glRef.current;
+      const currentFrame = playback.frames[frameIndex];
+      if (!glApi || !currentFrame || !playback.colors) return;
+      renderGl(glApi, currentFrame.xy, playback.count, resolution, particleSize);
+      syncSideView(sideApiRef.current, currentFrame.xyz, playback.colors, Math.max(1.6, particleSize * 0.52));
+    }, [frameIndex, playback, resolution, particleSize, sideViewVersion, sideInteractionVersion]);
+
+    useEffect(() => {
+      const tick = (time) => {
+        if (!playing || playback.frames.length <= 1) return;
+        const clock = playbackClockRef.current;
+        const previous = clock.lastTime || time;
+        clock.lastTime = time;
+        clock.accumulator += time - previous;
+        const frameDuration = 1000 / playback.fps;
+
+        if (clock.accumulator >= frameDuration) {
+          const step = Math.floor(clock.accumulator / frameDuration);
+          clock.accumulator -= step * frameDuration;
+          setFrameIndex((current) => {
+            const next = Math.min(playback.frames.length - 1, current + step);
+            if (next >= playback.frames.length - 1) {
+              setPlaying(false);
+            }
+            return next;
+          });
+        }
+
+        rafRef.current = requestAnimationFrame(tick);
+      };
+
+      cancelAnimationFrame(rafRef.current);
+      playbackClockRef.current = { lastTime: 0, accumulator: 0 };
+      if (playing && playback.frames.length > 1) {
+        rafRef.current = requestAnimationFrame(tick);
+      }
+      return () => cancelAnimationFrame(rafRef.current);
+    }, [playing, playback]);
+
+    const handleImageUpload = async (event) => {
+      const file = event.target.files?.[0];
+      const image = await loadImageFromFile(file);
+      if (image) setSourceImage(image);
+      event.target.value = '';
+    };
+
+    const replay = () => {
+      setFrameIndex(0);
+      setPlaying(true);
+    };
+
+    const stop = () => {
+      setPlaying(false);
+      setFrameIndex(playback.frames.length ? playback.frames.length - 1 : 0);
+    };
+
+    return (
+      <div className="app">
+        <div className="layout">
+          <div className="panel controls">
+            <div className="control">
+              <input type="file" accept="image/*" onChange={handleImageUpload} />
+            </div>
+            <div className="control">
+              <button className="primary" onClick={() => setPlaying((value) => !value)}>{playing ? 'Pause' : 'Play'}</button>
+            </div>
+            <div className="control">
+              <button onClick={replay}>Replay</button>
+            </div>
+            <div className="control">
+              <button onClick={stop}>Stop</button>
+            </div>
+            <div className="control">
+              <button onClick={() => rebuildSimulation(1)}>Render Again</button>
+            </div>
+            <div className="control">
+              <button onClick={() => rebuildSimulation(Math.floor(Math.random() * 1000000) + 1)}>Shuffle</button>
+            </div>
+            <div className="control slider">
+              <input
+                type="range"
+                min="0"
+                max={Math.max(0, playback.frames.length - 1)}
+                step="1"
+                value={Math.min(frameIndex, Math.max(0, playback.frames.length - 1))}
+                onChange={(event) => {
+                  setPlaying(false);
+                  setFrameIndex(Number(event.target.value));
+                }}
+              />
+            </div>
+          </div>
+
+          <div className="panel viewer">
+            <canvas className="glCanvasHidden" ref={glCanvasRef} />
+            <div className="cards">
+              <div className="card">
+                <canvas className="previewCanvas" ref={sourcePreviewRef} width="256" height="256" />
+              </div>
+              <div className="card">
+                <div className="sideWrap" ref={sideRef}></div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+</script>

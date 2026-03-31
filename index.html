@@ -1,0 +1,1072 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>WebGL Face Particle Remap</title>
+    <link rel="icon" href="data:," />
+    <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/gif.js/0.2.0/gif.js"></script>
+    <style>
+      :root {
+        --bg: #f5f5f5;
+        --panel: #ffffff;
+        --line: #d9d9d9;
+        --text: #111111;
+        --muted: #555555;
+        --accent: #1f1f1f;
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        font-family: Arial, Helvetica, sans-serif;
+        color: var(--text);
+        background: var(--bg);
+      }
+      #root { min-height: 100vh; }
+      .app { width: min(920px, calc(100vw - 32px)); margin: 0 auto; padding: 32px 0 40px; }
+      .hero { display: grid; gap: 8px; margin-bottom: 16px; text-align: center; justify-items: center; }
+      .hero h1 { margin: 0; font-size: 28px; line-height: 1.15; letter-spacing: 0; font-weight: 700; }
+      .hero p { margin: 0; max-width: 640px; color: var(--muted); font-size: 14px; line-height: 1.4; }
+      .pill { display: none; }
+      .layout { display: grid; grid-template-columns: 1fr; gap: 16px; justify-items: center; }
+      .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 0; box-shadow: none; }
+      .sidebar { width: 100%; max-width: 520px; padding: 16px; display: grid; gap: 16px; }
+      .section { display: grid; gap: 10px; }
+      .section h2, .section h3 { margin: 0; font-size: 16px; font-weight: 700; }
+      .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+      .grid-2 { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+      .control { display: grid; gap: 6px; }
+      label { font-size: 13px; color: var(--text); }
+      input[type="file"], input[type="range"], select { width: 100%; }
+      .dropzone {
+        border: 1px dashed var(--line);
+        padding: 20px;
+        text-align: center;
+        background: #fafafa;
+      }
+      .dropzone.dragging {
+        background: #f0f0f0;
+        border-color: #111111;
+      }
+      .dropzone input[type="file"] {
+        margin-top: 10px;
+      }
+      button, select {
+        border: 1px solid var(--line);
+        background: #ffffff;
+        color: var(--text);
+        border-radius: 0;
+        padding: 8px 10px;
+        font: inherit;
+      }
+      button.primary { background: #111111; color: #ffffff; border-color: #111111; }
+      .previewCanvas, .glCanvas {
+        width: 100%;
+        aspect-ratio: 1;
+        display: block;
+        border: 1px solid var(--line);
+        border-radius: 0;
+        background: #ffffff;
+      }
+      .main { width: 100%; padding: 16px; display: grid; gap: 14px; }
+      .stats { display: flex; gap: 12px; flex-wrap: wrap; color: var(--muted); font-size: 13px; justify-content: center; }
+      .cards { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; align-items: start; }
+      .card { display: grid; gap: 10px; padding: 12px; border-radius: 0; background: #ffffff; border: 1px solid var(--line); }
+      .small { font-size: 12px; color: var(--muted); line-height: 1.4; }
+      details {
+        border: 1px solid var(--line);
+        padding: 10px;
+        background: #ffffff;
+      }
+      summary {
+        cursor: pointer;
+        font-weight: 700;
+        margin-bottom: 10px;
+      }
+      @media (max-width: 1120px) {
+        .layout { grid-template-columns: 1fr; }
+        .cards { grid-template-columns: 1fr; }
+      }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="text/babel">
+      const { useCallback, useEffect, useMemo, useRef, useState } = React;
+
+      // Shaders
+
+      const VERTEX_SHADER = `
+        attribute vec2 aPosition;
+        attribute vec4 aColor;
+        uniform float uResolution;
+        uniform float uPointSize;
+        varying vec4 vColor;
+        void main() {
+          vec2 uv = (aPosition + vec2(0.5)) / uResolution;
+          vec2 clip = uv * 2.0 - 1.0;
+          clip.y *= -1.0;
+          gl_Position = vec4(clip, 0.0, 1.0);
+          gl_PointSize = uPointSize;
+          vColor = aColor;
+        }
+      `;
+
+      const FRAGMENT_SHADER = `
+        precision mediump float;
+        varying vec4 vColor;
+        uniform int uRenderMode;
+        void main() {
+          vec2 p = gl_PointCoord * 2.0 - 1.0;
+          float dist = dot(p, p);
+          float alpha = vColor.a;
+          if (uRenderMode == 1) {
+            if (dist > 1.0) discard;
+          } else if (uRenderMode == 2) {
+            if (dist > 1.0) discard;
+            alpha *= smoothstep(1.0, 0.0, dist);
+          }
+          gl_FragColor = vec4(vColor.rgb, alpha);
+        }
+      `;
+
+      // Image loading
+
+      function loadImageFromFile(file) {
+        return new Promise((resolve, reject) => {
+          if (!file) {
+            resolve(null);
+            return;
+          }
+          const reader = new FileReader();
+          reader.onload = () => {
+            const image = new Image();
+            image.onload = () => resolve(image);
+            image.onerror = reject;
+            image.src = reader.result;
+          };
+          reader.onerror = reject;
+          reader.readAsDataURL(file);
+        });
+      }
+
+      async function loadImageFromUrl(url) {
+        const response = await fetch(url, { cache: "no-store" });
+        if (!response.ok) {
+          throw new Error(`Missing image: ${url}`);
+        }
+        const blob = await response.blob();
+        const objectUrl = URL.createObjectURL(blob);
+        return new Promise((resolve, reject) => {
+          const image = new Image();
+          image.onload = () => {
+            URL.revokeObjectURL(objectUrl);
+            resolve(image);
+          };
+          image.onerror = (error) => {
+            URL.revokeObjectURL(objectUrl);
+            reject(error);
+          };
+          image.src = objectUrl;
+        });
+      }
+
+      let gifWorkerUrlPromise = null;
+
+      async function getGifWorkerUrl() {
+        if (!gifWorkerUrlPromise) {
+          gifWorkerUrlPromise = fetch("https://cdnjs.cloudflare.com/ajax/libs/gif.js/0.2.0/gif.worker.js", { cache: "force-cache" })
+            .then((response) => {
+              if (!response.ok) throw new Error("Failed to load GIF worker");
+              return response.text();
+            })
+            .then((source) => URL.createObjectURL(new Blob([source], { type: "application/javascript" })));
+        }
+        return gifWorkerUrlPromise;
+      }
+
+      function createFallbackImage(label, palette) {
+        const canvas = document.createElement("canvas");
+        canvas.width = 512;
+        canvas.height = 512;
+        const ctx = canvas.getContext("2d");
+        const gradient = ctx.createLinearGradient(0, 0, 512, 512);
+        gradient.addColorStop(0, palette[0]);
+        gradient.addColorStop(1, palette[1]);
+        ctx.fillStyle = gradient;
+        ctx.fillRect(0, 0, 512, 512);
+        ctx.fillStyle = palette[2];
+        ctx.beginPath();
+        ctx.arc(256, 180, 120, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.fillRect(140, 326, 232, 128);
+        ctx.fillStyle = palette[3];
+        ctx.fillRect(176, 154, 42, 16);
+        ctx.fillRect(294, 154, 42, 16);
+        ctx.fillRect(216, 262, 82, 18);
+        ctx.fillStyle = "rgba(255,255,255,0.75)";
+        ctx.font = "700 32px Georgia";
+        ctx.textAlign = "center";
+        ctx.fillText(label, 256, 474);
+        const image = new Image();
+        image.src = canvas.toDataURL("image/png");
+        return image;
+      }
+
+      // Crop helpers
+
+      function clamp(value, min, max) {
+        return Math.min(max, Math.max(min, value));
+      }
+
+      function createDefaultCrop() {
+        return { scale: 1, offsetX: 0.5, offsetY: 0.5 };
+      }
+
+      function drawCropPreview(canvas, image, crop) {
+        if (!canvas) return;
+        const ctx = canvas.getContext("2d");
+        const size = canvas.width;
+        ctx.clearRect(0, 0, size, size);
+        if (!image) {
+          ctx.fillStyle = "#e8dcc9";
+          ctx.fillRect(0, 0, size, size);
+          return;
+        }
+        const side = Math.min(image.width, image.height) / crop.scale;
+        const sx = clamp(crop.offsetX, 0, 1) * Math.max(0, image.width - side);
+        const sy = clamp(crop.offsetY, 0, 1) * Math.max(0, image.height - side);
+        ctx.drawImage(image, sx, sy, side, side, 0, 0, size, size);
+      }
+
+      function sampleSquareImage(image, crop, resolution) {
+        const canvas = document.createElement("canvas");
+        canvas.width = resolution;
+        canvas.height = resolution;
+        const ctx = canvas.getContext("2d", { willReadFrequently: true });
+        if (image) {
+          const side = Math.min(image.width, image.height) / crop.scale;
+          const sx = clamp(crop.offsetX, 0, 1) * Math.max(0, image.width - side);
+          const sy = clamp(crop.offsetY, 0, 1) * Math.max(0, image.height - side);
+          ctx.drawImage(image, sx, sy, side, side, 0, 0, resolution, resolution);
+        }
+        return { canvas, pixels: ctx.getImageData(0, 0, resolution, resolution).data };
+      }
+      // Target extraction
+
+      function pixelLuma(pixels, index) {
+        return (pixels[index] * 0.299 + pixels[index + 1] * 0.587 + pixels[index + 2] * 0.114) / 255;
+      }
+
+      function computeEdgeMap(pixels, resolution) {
+        const edge = new Float32Array(resolution * resolution);
+        for (let y = 1; y < resolution - 1; y++) {
+          for (let x = 1; x < resolution - 1; x++) {
+            const i = y * resolution + x;
+            const idx = i * 4;
+            const l = pixelLuma(pixels, idx);
+            const lx = pixelLuma(pixels, idx + 4) - pixelLuma(pixels, idx - 4);
+            const ly = pixelLuma(pixels, idx + resolution * 4) - pixelLuma(pixels, idx - resolution * 4);
+            edge[i] = Math.abs(lx) + Math.abs(ly) + (1 - l) * 0.35;
+          }
+        }
+        return edge;
+      }
+
+      function buildTargetMask(targetPixels, resolution, threshold) {
+        const edge = computeEdgeMap(targetPixels, resolution);
+        const mask = new Uint8Array(resolution * resolution);
+        for (let y = 0; y < resolution; y++) {
+          for (let x = 0; x < resolution; x++) {
+            const i = y * resolution + x;
+            const idx = i * 4;
+            const alpha = targetPixels[idx + 3] / 255;
+            const luma = pixelLuma(targetPixels, idx);
+            const darkness = 1 - luma;
+            const structure = darkness * 0.9 + edge[i] * 1.2 + alpha * 0.15;
+            if (alpha > 0.1 && (darkness > threshold || edge[i] > threshold * 0.65 || structure > threshold * 1.15)) {
+              mask[i] = 1;
+            }
+          }
+        }
+
+        // Small neighbor vote keeps the mask contiguous enough to preserve face structure.
+        const refined = new Uint8Array(mask.length);
+        for (let y = 0; y < resolution; y++) {
+          for (let x = 0; x < resolution; x++) {
+            let neighbors = 0;
+            for (let oy = -1; oy <= 1; oy++) {
+              for (let ox = -1; ox <= 1; ox++) {
+                const nx = x + ox;
+                const ny = y + oy;
+                if (nx < 0 || ny < 0 || nx >= resolution || ny >= resolution) continue;
+                neighbors += mask[ny * resolution + nx];
+              }
+            }
+            const i = y * resolution + x;
+            refined[i] = mask[i] || neighbors >= 4 ? 1 : 0;
+          }
+        }
+        return refined;
+      }
+
+      function extractTargetPoints(targetPixels, resolution, threshold, count) {
+        const mask = buildTargetMask(targetPixels, resolution, threshold);
+        const occupied = [];
+        for (let y = 0; y < resolution; y++) {
+          for (let x = 0; x < resolution; x++) {
+            const index = y * resolution + x;
+            if (mask[index]) {
+              const idx = index * 4;
+              occupied.push({
+                x,
+                y,
+                brightness: pixelLuma(targetPixels, idx),
+                nx: x / Math.max(1, resolution - 1),
+                ny: y / Math.max(1, resolution - 1),
+              });
+            }
+          }
+        }
+
+        if (!occupied.length) {
+          for (let y = 0; y < resolution; y++) {
+            for (let x = 0; x < resolution; x++) {
+              const idx = (y * resolution + x) * 4;
+              occupied.push({
+                x,
+                y,
+                brightness: pixelLuma(targetPixels, idx),
+                nx: x / Math.max(1, resolution - 1),
+                ny: y / Math.max(1, resolution - 1),
+              });
+            }
+          }
+        }
+
+        occupied.sort((a, b) => (a.y - b.y) || (a.x - b.x));
+
+        const chosen = [];
+        if (occupied.length >= count) {
+          const step = occupied.length / count;
+          for (let i = 0; i < count; i++) {
+            chosen.push(occupied[Math.min(occupied.length - 1, Math.floor(i * step))]);
+          }
+        } else {
+          for (const point of occupied) {
+            chosen.push({ ...point });
+          }
+          let duplicateIndex = 0;
+          while (chosen.length < count) {
+            const base = occupied[duplicateIndex % occupied.length];
+            const ring = Math.floor(duplicateIndex / occupied.length) + 1;
+            const angle = duplicateIndex * 2.399963229728653;
+            const radius = Math.min(0.42, 0.11 * ring);
+            const x = clamp(base.x + Math.cos(angle) * radius, 0, resolution - 1);
+            const y = clamp(base.y + Math.sin(angle) * radius, 0, resolution - 1);
+            chosen.push({
+              x,
+              y,
+              brightness: base.brightness,
+              nx: x / Math.max(1, resolution - 1),
+              ny: y / Math.max(1, resolution - 1),
+            });
+            duplicateIndex++;
+          }
+        }
+        return annotateRevealSchedule(chosen, resolution);
+      }
+
+      function annotateRevealSchedule(targetPoints, resolution) {
+        if (!targetPoints.length) return targetPoints;
+        const gridSize = Math.max(4, Math.min(8, Math.round(Math.sqrt(targetPoints.length) / 16)));
+        const clustersByKey = new Map();
+
+        for (const point of targetPoints) {
+          const gx = clamp(Math.floor(point.nx * gridSize), 0, gridSize - 1);
+          const gy = clamp(Math.floor(point.ny * gridSize), 0, gridSize - 1);
+          const key = `${gx}:${gy}`;
+          let cluster = clustersByKey.get(key);
+          if (!cluster) {
+            cluster = { points: [], sumX: 0, sumY: 0, sumBrightness: 0 };
+            clustersByKey.set(key, cluster);
+          }
+          cluster.points.push(point);
+          cluster.sumX += point.nx;
+          cluster.sumY += point.ny;
+          cluster.sumBrightness += point.brightness;
+        }
+
+        const clusters = [...clustersByKey.values()].map((cluster) => {
+          const count = cluster.points.length;
+          const cx = cluster.sumX / count;
+          const cy = cluster.sumY / count;
+          const avgBrightness = cluster.sumBrightness / count;
+          const centerDx = cx - 0.5;
+          const centerDy = cy - 0.42;
+          const centerDistance = Math.hypot(centerDx, centerDy);
+          const portraitBias = Math.abs(cy - 0.42) * 0.55 + (cx < 0.2 || cx > 0.8 ? 0.16 : 0);
+          cluster.cx = cx;
+          cluster.cy = cy;
+          cluster.avgBrightness = avgBrightness;
+          cluster.priority = centerDistance * 1.4 + portraitBias + avgBrightness * 0.18;
+          return cluster;
+        });
+
+        clusters.sort((a, b) => a.priority - b.priority);
+        const span = Math.max(1, clusters.length - 1);
+
+        for (let clusterIndex = 0; clusterIndex < clusters.length; clusterIndex++) {
+          const cluster = clusters[clusterIndex];
+          const clusterBase = 0.05 + (clusterIndex / span) * 0.72;
+          for (let pointIndex = 0; pointIndex < cluster.points.length; pointIndex++) {
+            const point = cluster.points[pointIndex];
+            const localDistance = Math.hypot(point.nx - cluster.cx, point.ny - cluster.cy);
+            const localJitter = (Math.sin((point.x + 1) * 12.9898 + (point.y + 1) * 78.233) * 43758.5453) % 1;
+            const jitter = Math.abs(localJitter) * 0.035;
+            point.revealAt = clamp(clusterBase + localDistance * 0.45 + jitter, 0, 0.96);
+          }
+        }
+
+        return targetPoints;
+      }
+
+      // Particle initialization
+      function buildParticles(sourcePixels, resolution) {
+        const count = resolution * resolution;
+        const particles = new Array(count);
+        const positions = new Float32Array(count * 2);
+        const colors = new Float32Array(count * 4);
+        let p = 0;
+        let c = 0;
+        for (let y = 0; y < resolution; y++) {
+          for (let x = 0; x < resolution; x++) {
+            const id = y * resolution + x;
+              const idx = id * 4;
+              const r = sourcePixels[idx] / 255;
+              const g = sourcePixels[idx + 1] / 255;
+              const b = sourcePixels[idx + 2] / 255;
+              const a = sourcePixels[idx + 3] / 255;
+              particles[id] = {
+                id,
+                sourceX: x,
+              sourceY: y,
+              sourceNX: x / Math.max(1, resolution - 1),
+              sourceNY: y / Math.max(1, resolution - 1),
+              currentX: x,
+              currentY: y,
+              targetX: x,
+              targetY: y,
+              vx: 0,
+              vy: 0,
+              brightness: r * 0.299 + g * 0.587 + b * 0.114,
+            };
+              positions[p++] = x;
+              positions[p++] = y;
+              colors[c++] = r;
+              colors[c++] = g;
+              colors[c++] = b;
+              colors[c++] = a;
+            }
+          }
+          return { particles, positions, colors };
+        }
+      // Mapping
+
+      function mulberry32(seed) {
+        let t = seed >>> 0;
+        return function () {
+          t += 0x6d2b79f5;
+          let r = Math.imul(t ^ (t >>> 15), t | 1);
+          r ^= r + Math.imul(r ^ (r >>> 7), r | 61);
+          return ((r ^ (r >>> 14)) >>> 0) / 4294967296;
+        };
+      }
+
+      function makeInitialAssignments(particles, targetPoints, seed) {
+        const rng = mulberry32(seed);
+        const sourceOrder = particles.map((particle) => particle.id);
+        const targetOrder = targetPoints.map((_, index) => index);
+        sourceOrder.sort((a, b) => {
+          const ay = particles[a].sourceY - particles[b].sourceY;
+          const ax = particles[a].sourceX - particles[b].sourceX;
+          const diff = ay || ax;
+          return diff || (particles[a].brightness - particles[b].brightness) || (rng() - 0.5);
+        });
+        targetOrder.sort((a, b) => {
+          const py = targetPoints[a].y - targetPoints[b].y;
+          const px = targetPoints[a].x - targetPoints[b].x;
+          const diff = py || px;
+          return diff || (targetPoints[a].brightness - targetPoints[b].brightness) || (rng() - 0.5);
+        });
+        const assignments = new Int32Array(particles.length);
+        for (let i = 0; i < particles.length; i++) {
+          assignments[sourceOrder[i]] = targetOrder[i % targetOrder.length];
+        }
+        return assignments;
+      }
+
+      function assignmentScore(particle, targetPoint, proximityImportance) {
+        const dx = particle.sourceNX - targetPoint.nx;
+        const dy = particle.sourceNY - targetPoint.ny;
+        const spatial = dx * dx + dy * dy;
+        const brightness = particle.brightness - targetPoint.brightness;
+        return brightness * brightness * 24 + spatial * proximityImportance * 180;
+      }
+
+      function setParticleDestination(particle, target) {
+        particle.targetX = target.x;
+        particle.targetY = target.y;
+        particle.revealAt = target.revealAt ?? clamp(target.ny * 0.78 + target.nx * 0.22, 0, 1);
+      }
+
+      function applyAssignments(particles, targetPoints, assignments) {
+        for (let i = 0; i < particles.length; i++) {
+          const target = targetPoints[assignments[i]];
+          setParticleDestination(particles[i], target);
+        }
+      }
+
+      function improveAssignments(state, budget) {
+        if (!state || !state.particles || !state.targetPoints) return 0;
+        const { particles, targetPoints, assignments, proximityImportance, rng } = state;
+        const total = particles.length;
+        let accepted = 0;
+        for (let step = 0; step < budget; step++) {
+          const a = (rng() * total) | 0;
+          let b = (rng() * total) | 0;
+          if (a === b) b = (b + 1) % total;
+          const particleA = particles[a];
+          const particleB = particles[b];
+          const assignA = assignments[a];
+          const assignB = assignments[b];
+          const targetA = targetPoints[assignA];
+          const targetB = targetPoints[assignB];
+          const before = assignmentScore(particleA, targetA, proximityImportance) + assignmentScore(particleB, targetB, proximityImportance);
+          const after = assignmentScore(particleA, targetB, proximityImportance) + assignmentScore(particleB, targetA, proximityImportance);
+            if (after < before) {
+              assignments[a] = assignB;
+              assignments[b] = assignA;
+              setParticleDestination(particleA, targetB);
+              setParticleDestination(particleB, targetA);
+              accepted++;
+            }
+          }
+          return accepted;
+        }
+
+      // Animation
+
+      function restartParticles(particles) {
+        for (const particle of particles) {
+          particle.currentX = particle.sourceX;
+          particle.currentY = particle.sourceY;
+          particle.vx = 0;
+          particle.vy = 0;
+        }
+      }
+
+      function stepParticles(particles, dt, springStrength, damping, revealProgress) {
+        let movingCount = 0;
+        for (const particle of particles) {
+          const reveal = clamp((revealProgress - particle.revealAt) * 5, 0, 1);
+          const easedReveal = reveal * reveal * (3 - 2 * reveal);
+          const goalX = particle.sourceX + (particle.targetX - particle.sourceX) * easedReveal;
+          const goalY = particle.sourceY + (particle.targetY - particle.sourceY) * easedReveal;
+          const ax = (goalX - particle.currentX) * springStrength;
+          const ay = (goalY - particle.currentY) * springStrength;
+          particle.vx = (particle.vx + ax * dt) * damping;
+          particle.vy = (particle.vy + ay * dt) * damping;
+          particle.currentX += particle.vx * dt * 60;
+          particle.currentY += particle.vy * dt * 60;
+          if (
+            Math.abs(goalX - particle.currentX) +
+              Math.abs(goalY - particle.currentY) +
+              Math.abs(particle.vx) +
+              Math.abs(particle.vy) >
+            0.02
+          ) {
+            movingCount++;
+          } else {
+            particle.currentX = goalX;
+            particle.currentY = goalY;
+            particle.vx = 0;
+            particle.vy = 0;
+          }
+        }
+        return movingCount;
+      }
+
+      // WebGL rendering
+
+      function compileShader(gl, type, source) {
+        const shader = gl.createShader(type);
+        gl.shaderSource(shader, source);
+        gl.compileShader(shader);
+        if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+          throw new Error(gl.getShaderInfoLog(shader) || "Shader compile failed");
+        }
+        return shader;
+      }
+
+      function createProgram(gl) {
+        const program = gl.createProgram();
+        gl.attachShader(program, compileShader(gl, gl.VERTEX_SHADER, VERTEX_SHADER));
+        gl.attachShader(program, compileShader(gl, gl.FRAGMENT_SHADER, FRAGMENT_SHADER));
+        gl.linkProgram(program);
+        if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+          throw new Error(gl.getProgramInfoLog(program) || "Program link failed");
+        }
+        return program;
+      }
+
+      function initGl(canvas) {
+        const gl = canvas.getContext("webgl", { antialias: true, preserveDrawingBuffer: true });
+        if (!gl) throw new Error("WebGL not supported");
+        const program = createProgram(gl);
+        const positionBuffer = gl.createBuffer();
+        const colorBuffer = gl.createBuffer();
+        gl.useProgram(program);
+        gl.enable(gl.BLEND);
+        gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+        return {
+          gl,
+          program,
+          positionBuffer,
+          colorBuffer,
+          aPosition: gl.getAttribLocation(program, "aPosition"),
+          aColor: gl.getAttribLocation(program, "aColor"),
+          uResolution: gl.getUniformLocation(program, "uResolution"),
+          uPointSize: gl.getUniformLocation(program, "uPointSize"),
+          uRenderMode: gl.getUniformLocation(program, "uRenderMode"),
+        };
+      }
+
+      function uploadStaticColors(glApi, colors) {
+        const { gl, colorBuffer, aColor } = glApi;
+        gl.bindBuffer(gl.ARRAY_BUFFER, colorBuffer);
+        gl.bufferData(gl.ARRAY_BUFFER, colors, gl.STATIC_DRAW);
+        gl.enableVertexAttribArray(aColor);
+        gl.vertexAttribPointer(aColor, 4, gl.FLOAT, false, 0, 0);
+      }
+
+      function renderGl(glApi, positions, count, resolution, particleSize, renderMode) {
+        const { gl, positionBuffer, aPosition, uResolution, uPointSize, uRenderMode } = glApi;
+        const dpr = window.devicePixelRatio || 1;
+        const canvas = gl.canvas;
+        const width = Math.floor(canvas.clientWidth * dpr);
+        const height = Math.floor(canvas.clientHeight * dpr);
+        if (canvas.width !== width || canvas.height !== height) {
+          canvas.width = width;
+          canvas.height = height;
+        }
+        gl.viewport(0, 0, canvas.width, canvas.height);
+        gl.clearColor(1.0, 1.0, 1.0, 0.0);
+        gl.clear(gl.COLOR_BUFFER_BIT);
+        gl.enable(gl.BLEND);
+        gl.useProgram(glApi.program);
+        gl.uniform1f(uResolution, resolution);
+        gl.uniform1f(uPointSize, particleSize * dpr);
+        gl.uniform1i(uRenderMode, renderMode);
+        gl.bindBuffer(gl.ARRAY_BUFFER, positionBuffer);
+        gl.bufferData(gl.ARRAY_BUFFER, positions, gl.DYNAMIC_DRAW);
+        gl.enableVertexAttribArray(aPosition);
+        gl.vertexAttribPointer(aPosition, 2, gl.FLOAT, false, 0, 0);
+        gl.drawArrays(gl.POINTS, 0, count);
+      }
+
+      // UI
+
+      function CropPanel({ title, image, crop, setCrop, previewRef }) {
+        useEffect(() => {
+          drawCropPreview(previewRef.current, image, crop);
+        }, [image, crop, previewRef]);
+
+        return (
+          <div className="section">
+            <div className="row" style={{ justifyContent: "space-between" }}>
+              <h3>{title}</h3>
+              <span className="pill">{image ? `${image.width} x ${image.height}` : "No image"}</span>
+            </div>
+            <canvas className="previewCanvas" ref={previewRef} width="256" height="256" />
+            <div className="control">
+              <label>Scale: {crop.scale.toFixed(2)}x</label>
+              <input type="range" min="1" max="3" step="0.01" value={crop.scale} onChange={(e) => setCrop({ ...crop, scale: Number(e.target.value) })} />
+            </div>
+            <div className="control">
+              <label>Horizontal crop: {crop.offsetX.toFixed(2)}</label>
+              <input type="range" min="0" max="1" step="0.001" value={crop.offsetX} onChange={(e) => setCrop({ ...crop, offsetX: Number(e.target.value) })} />
+            </div>
+            <div className="control">
+              <label>Vertical crop: {crop.offsetY.toFixed(2)}</label>
+              <input type="range" min="0" max="1" step="0.001" value={crop.offsetY} onChange={(e) => setCrop({ ...crop, offsetY: Number(e.target.value) })} />
+            </div>
+          </div>
+        );
+      }
+
+      function App() {
+        const [sourceImage, setSourceImage] = useState(() => createFallbackImage("Source", ["#d9632f", "#f0bf62", "rgba(247, 232, 213, 0.96)", "rgba(38, 24, 18, 0.72)"]));
+        const [targetImage, setTargetImage] = useState(() => createFallbackImage("Target", ["#1d6f7c", "#89bfd9", "rgba(237, 216, 196, 0.97)", "rgba(24, 15, 12, 0.76)"]));
+        const [sourceCrop, setSourceCrop] = useState(createDefaultCrop);
+        const [targetCrop, setTargetCrop] = useState(createDefaultCrop);
+        const [resolution, setResolution] = useState(160);
+        const [particleSize, setParticleSize] = useState(6.5);
+        const [springStrength, setSpringStrength] = useState(14);
+        const [damping, setDamping] = useState(0.84);
+        const [threshold, setThreshold] = useState(0.28);
+        const [proximityImportance, setProximityImportance] = useState(0.55);
+        const [qualitySpeed, setQualitySpeed] = useState(0.55);
+        const [isDragging, setIsDragging] = useState(false);
+        const renderMode = 0;
+        const [playing, setPlaying] = useState(true);
+        const [stats, setStats] = useState({ particles: 0, targetPoints: 0, accepted: 0, swaps: 0 });
+
+        const glCanvasRef = useRef(null);
+        const sourcePreviewRef = useRef(null);
+        const targetPreviewRef = useRef(null);
+        const sourceGridRef = useRef(null);
+        const targetGridRef = useRef(null);
+        const glRef = useRef(null);
+        const simRef = useRef(null);
+        const captureRef = useRef(null);
+        const rafRef = useRef(0);
+        const lastTimeRef = useRef(0);
+
+        const sampledSource = useMemo(() => sampleSquareImage(sourceImage, sourceCrop, resolution), [sourceImage, sourceCrop, resolution]);
+        const sampledTarget = useMemo(() => sampleSquareImage(targetImage, targetCrop, resolution), [targetImage, targetCrop, resolution]);
+
+        useEffect(() => {
+          drawCropPreview(sourceGridRef.current, sampledSource.canvas, createDefaultCrop());
+          drawCropPreview(targetGridRef.current, sampledTarget.canvas, createDefaultCrop());
+        }, [sampledSource, sampledTarget]);
+
+        useEffect(() => {
+          if (!glRef.current && glCanvasRef.current) {
+            glRef.current = initGl(glCanvasRef.current);
+            if (simRef.current) {
+              uploadStaticColors(glRef.current, simRef.current.colors);
+            }
+          }
+        }, []);
+
+        useEffect(() => {
+          let active = true;
+          loadImageFromUrl("./image.jpg")
+            .then((image) => {
+              if (active) {
+                setTargetImage(image);
+              }
+            })
+            .catch(() => {});
+          return () => {
+            active = false;
+          };
+        }, []);
+
+        const rebuildSimulation = useCallback((seed = 1) => {
+          const { particles, positions, colors } = buildParticles(sampledSource.pixels, resolution);
+          const targetPoints = extractTargetPoints(sampledTarget.pixels, resolution, threshold, particles.length);
+          const assignments = makeInitialAssignments(particles, targetPoints, seed);
+          applyAssignments(particles, targetPoints, assignments);
+          restartParticles(particles);
+          simRef.current = {
+            particles,
+            positions,
+            colors,
+            targetPoints,
+            assignments,
+            proximityImportance,
+            rng: mulberry32(seed * 101 + resolution),
+            acceptedTotal: 0,
+            stagnantFrames: 0,
+            optimizeActive: true,
+            revealProgress: 0,
+            movingCount: particles.length,
+            autoPaused: false,
+          };
+          if (glRef.current) {
+            uploadStaticColors(glRef.current, colors);
+          }
+          setStats({ particles: particles.length, targetPoints: targetPoints.length, accepted: 0, swaps: 0 });
+        }, [sampledSource, sampledTarget, resolution, threshold, proximityImportance]);
+
+        useEffect(() => {
+          rebuildSimulation(1);
+        }, [rebuildSimulation]);
+
+        useEffect(() => {
+          let statFrame = 0;
+          const frame = (time) => {
+            const sim = simRef.current;
+            const glApi = glRef.current;
+            if (!sim || !glApi) {
+              rafRef.current = requestAnimationFrame(frame);
+              return;
+            }
+            const previous = lastTimeRef.current || time;
+            lastTimeRef.current = time;
+            const dt = Math.min(0.033, (time - previous) / 1000 || 0.016);
+            if (playing) {
+              const revealRate = 0.1 + (1 - qualitySpeed) * 0.18;
+              sim.revealProgress = Math.min(1, sim.revealProgress + dt * revealRate);
+
+              let budget = 0;
+              if (sim.optimizeActive) {
+                budget = Math.max(24, Math.floor(sim.particles.length * (0.08 + qualitySpeed * 0.42)));
+                const accepted = improveAssignments({
+                  particles: sim.particles,
+                  targetPoints: sim.targetPoints,
+                  assignments: sim.assignments,
+                  proximityImportance,
+                  rng: sim.rng,
+                }, budget);
+                sim.acceptedTotal += accepted;
+                sim.stagnantFrames = accepted === 0 ? sim.stagnantFrames + 1 : 0;
+                if (sim.stagnantFrames > 45 || (sim.revealProgress >= 1 && accepted < 2 && sim.stagnantFrames > 12)) {
+                  sim.optimizeActive = false;
+                }
+              }
+
+              sim.movingCount = stepParticles(sim.particles, dt, springStrength * 0.62, damping, sim.revealProgress);
+              if (sim.revealProgress >= 1 && sim.movingCount === 0 && !sim.optimizeActive) {
+                sim.movingCount = 0;
+              }
+              }
+              let p = 0;
+              for (const particle of sim.particles) {
+                sim.positions[p++] = particle.currentX;
+                sim.positions[p++] = particle.currentY;
+              }
+              renderGl(glApi, sim.positions, sim.particles.length, resolution, particleSize, renderMode);
+
+              const capture = captureRef.current;
+              if (capture?.active && !capture.rendering) {
+                capture.elapsed += dt * 1000;
+                if (capture.frames === 0 || capture.elapsed >= capture.delayMs) {
+                  capture.gif.addFrame(glApi.gl.canvas, { copy: true, delay: capture.delayMs });
+                  capture.elapsed = 0;
+                  capture.frames++;
+                }
+                if ((sim.revealProgress >= 1 && sim.movingCount === 0 && !sim.optimizeActive) || capture.frames >= capture.maxFrames) {
+                  capture.active = false;
+                  capture.rendering = true;
+                  capture.gif.render();
+                }
+              }
+
+              if (playing && sim.revealProgress >= 1 && sim.movingCount === 0 && !sim.optimizeActive && !sim.autoPaused) {
+                sim.autoPaused = true;
+                setPlaying(false);
+              }
+
+              statFrame++;
+            if (statFrame % 12 === 0) {
+              setStats({
+                particles: sim.particles.length,
+                targetPoints: sim.targetPoints.length,
+                accepted: sim.acceptedTotal,
+                swaps: sim.optimizeActive ? Math.max(24, Math.floor(sim.particles.length * (0.08 + qualitySpeed * 0.42))) : 0,
+              });
+            }
+            rafRef.current = requestAnimationFrame(frame);
+          };
+          cancelAnimationFrame(rafRef.current);
+          lastTimeRef.current = 0;
+          rafRef.current = requestAnimationFrame(frame);
+          return () => cancelAnimationFrame(rafRef.current);
+          }, [playing, particleSize, springStrength, damping, resolution, proximityImportance, qualitySpeed]);
+
+        const loadSourceFile = async (file) => {
+          const image = await loadImageFromFile(file);
+          if (image) setSourceImage(image);
+        };
+
+        const handleImageUpload = async (event) => {
+          const file = event.target.files?.[0];
+          await loadSourceFile(file);
+          event.target.value = "";
+        };
+
+        const handleDrop = async (event) => {
+          event.preventDefault();
+          setIsDragging(false);
+          const file = event.dataTransfer?.files?.[0];
+          if (file) {
+            await loadSourceFile(file);
+          }
+        };
+
+        const restart = () => {
+          if (simRef.current) {
+            restartParticles(simRef.current.particles);
+            simRef.current.revealProgress = 0;
+            simRef.current.movingCount = simRef.current.particles.length;
+            simRef.current.optimizeActive = true;
+            simRef.current.stagnantFrames = 0;
+            simRef.current.autoPaused = false;
+            setPlaying(true);
+          }
+        };
+
+        const randomizeMapping = () => {
+          rebuildSimulation(Math.floor(Math.random() * 1000000) + 1);
+        };
+
+        const renderNow = () => {
+          rebuildSimulation(1);
+        };
+
+        const exportGif = async () => {
+          if (!window.GIF || !glCanvasRef.current || !simRef.current) return;
+          const workerScript = await getGifWorkerUrl();
+          restartParticles(simRef.current.particles);
+          simRef.current.revealProgress = 0;
+          simRef.current.movingCount = simRef.current.particles.length;
+          simRef.current.optimizeActive = true;
+          simRef.current.stagnantFrames = 0;
+          simRef.current.acceptedTotal = 0;
+          simRef.current.autoPaused = false;
+          setPlaying(true);
+
+          const gif = new window.GIF({
+            workers: 2,
+            quality: 10,
+            workerScript,
+            width: glCanvasRef.current.width || 512,
+            height: glCanvasRef.current.height || 512,
+          });
+
+          gif.on("finished", (blob) => {
+            const url = URL.createObjectURL(blob);
+            const link = document.createElement("a");
+            link.href = url;
+            link.download = `webgl-face-particles-${Date.now()}.gif`;
+            link.click();
+            setTimeout(() => URL.revokeObjectURL(url), 1000);
+          });
+
+          captureRef.current = {
+            active: true,
+            rendering: false,
+            gif,
+            elapsed: 0,
+            frames: 0,
+            maxFrames: 72,
+            delayMs: 80,
+          };
+        };
+
+          return (
+            <div className="app">
+              <div className="hero">
+                <h1>Image in, image out</h1>
+                <p>Upload one image. The app uses `image.jpg` as the target when it exists, then shows the output below.</p>
+              </div>
+
+              <div className="layout">
+                <div className="panel sidebar">
+                  <div className="section">
+                    <h2>Input</h2>
+                    <div className="control">
+                      <label>Image upload</label>
+                      <div
+                        className={`dropzone${isDragging ? " dragging" : ""}`}
+                        onDragOver={(event) => {
+                          event.preventDefault();
+                          setIsDragging(true);
+                        }}
+                        onDragEnter={(event) => {
+                          event.preventDefault();
+                          setIsDragging(true);
+                        }}
+                        onDragLeave={(event) => {
+                          event.preventDefault();
+                          setIsDragging(false);
+                        }}
+                        onDrop={handleDrop}
+                      >
+                        <div>Drop an image here or choose a file.</div>
+                        <input type="file" accept="image/*" onChange={handleImageUpload} />
+                      </div>
+                    </div>
+                      <div className="grid-2">
+                        <button className="primary" onClick={renderNow}>Render again</button>
+                        <button onClick={exportGif}>Export GIF</button>
+                      </div>
+                  </div>
+
+                  <details>
+                    <summary>Advanced</summary>
+                    <CropPanel title="Source crop" image={sourceImage} crop={sourceCrop} setCrop={setSourceCrop} previewRef={sourcePreviewRef} />
+                    <div className="section">
+                      <div className="control">
+                          <label>Resolution: {resolution} x {resolution}</label>
+                          <input type="range" min="96" max="256" step="32" value={resolution} onChange={(e) => setResolution(Number(e.target.value))} />
+                        </div>
+                      <div className="control">
+                        <label>Particle size: {particleSize.toFixed(1)}</label>
+                        <input type="range" min="2" max="14" step="0.1" value={particleSize} onChange={(e) => setParticleSize(Number(e.target.value))} />
+                      </div>
+                      <div className="control">
+                        <label>Spring strength: {springStrength.toFixed(1)}</label>
+                        <input type="range" min="2" max="30" step="0.1" value={springStrength} onChange={(e) => setSpringStrength(Number(e.target.value))} />
+                      </div>
+                      <div className="control">
+                        <label>Damping: {damping.toFixed(2)}</label>
+                        <input type="range" min="0.65" max="0.98" step="0.01" value={damping} onChange={(e) => setDamping(Number(e.target.value))} />
+                      </div>
+                      <div className="control">
+                        <label>Target threshold: {threshold.toFixed(2)}</label>
+                        <input type="range" min="0.02" max="0.9" step="0.01" value={threshold} onChange={(e) => setThreshold(Number(e.target.value))} />
+                      </div>
+                      <div className="control">
+                        <label>Proximity importance: {proximityImportance.toFixed(2)}</label>
+                        <input type="range" min="0.05" max="2" step="0.01" value={proximityImportance} onChange={(e) => setProximityImportance(Number(e.target.value))} />
+                      </div>
+                      <div className="control">
+                        <label>Quality vs speed: {qualitySpeed.toFixed(2)}</label>
+                        <input type="range" min="0" max="1" step="0.01" value={qualitySpeed} onChange={(e) => setQualitySpeed(Number(e.target.value))} />
+                      </div>
+                      <div className="grid-2">
+                        <button onClick={() => setPlaying((v) => !v)}>{playing ? "Pause" : "Play"}</button>
+                        <button onClick={restart}>Restart</button>
+                      </div>
+                      <div className="grid-2">
+                        <button onClick={randomizeMapping}>Randomize mapping</button>
+                      </div>
+                    </div>
+                  </details>
+                </div>
+
+              <div className="panel main">
+                <div className="stats">
+                  <span>Particles: {stats.particles.toLocaleString()}</span>
+                  <span>Target points: {stats.targetPoints.toLocaleString()}</span>
+                  <span>Accepted swaps: {stats.accepted.toLocaleString()}</span>
+                  <span>Swap budget / frame: {stats.swaps.toLocaleString()}</span>
+                </div>
+                <div className="cards">
+                  <div className="card">
+                    <strong>Image upload</strong>
+                    <canvas className="previewCanvas" ref={sourceGridRef} width="256" height="256" />
+                  </div>
+                  <div className="card">
+                    <strong>Output</strong>
+                    <canvas className="glCanvas" ref={glCanvasRef} />
+                    <div className="small">Updates automatically when images or settings change.</div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        );
+      }
+
+      ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+    </script>
+  </body>
+</html>

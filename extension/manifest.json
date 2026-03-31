@@ -1,0 +1,40 @@
+{
+  "manifest_version": 3,
+  "name": "Jokoify",
+  "version": "0.1.0",
+  "description": "Animates YouTube thumbnails into a calculated particle image with a configurable budget.",
+  "permissions": [
+    "storage"
+  ],
+  "host_permissions": [
+    "https://www.youtube.com/*",
+    "https://i.ytimg.com/*",
+    "https://*.googleusercontent.com/*",
+    "https://yt3.ggpht.com/*"
+  ],
+  "action": {
+    "default_title": "Jokoify",
+    "default_popup": "popup.html"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://www.youtube.com/*"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "target.jpg"
+      ],
+      "matches": [
+        "https://www.youtube.com/*"
+      ]
+    }
+  ]
+}
